@@ -52,9 +52,19 @@ public final class AirPlayReceiverController {
     private static let outputSampleRate = 48_000
     private static let outputChannels = 2
 
-    public private(set) var isRunning = false
-    public private(set) var lastError: Error?
+    /// Reflects the pipeline manager's live state rather than a snapshot taken
+    /// at `start()` — otherwise a stage that dies later (e.g. shairport-sync
+    /// losing a port-5000 race to another AirPlay receiver, detected by the
+    /// pipeline manager's liveness monitor a few seconds in) would leave
+    /// `isRunning`/`lastError` stuck reporting the launch-time result forever.
+    public var isRunning: Bool { pipelineManager.status == .running }
+    public var lastError: Error? {
+        preflightError ?? pipelineManager.lastFailure.map {
+            AirPlayReceiverError.startFailed("\($0.functionName) exited unexpectedly (status \($0.terminationStatus)): \($0.reason)")
+        }
+    }
 
+    private var preflightError: Error?
     private var configuration: Configuration
     private let pipelineManager = TaskPipelineManager()
 
@@ -70,10 +80,11 @@ public final class AirPlayReceiverController {
 
     public func start() {
         stop()
+        preflightError = nil
 
         let executablePath = Self.shairportSyncExecutableURL.path
         guard FileManager.default.isExecutableFile(atPath: executablePath) else {
-            lastError = AirPlayReceiverError.executableMissing(executablePath)
+            preflightError = AirPlayReceiverError.executableMissing(executablePath)
             return
         }
 
@@ -92,7 +103,7 @@ public final class AirPlayReceiverController {
         // reliably find Contents/Helpers executables, so build the path directly.
         let udpSenderPath = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/PCMUDPSender").path
         guard FileManager.default.isExecutableFile(atPath: udpSenderPath) else {
-            lastError = AirPlayReceiverError.executableMissing(udpSenderPath)
+            preflightError = AirPlayReceiverError.executableMissing(udpSenderPath)
             return
         }
         let udpSender = pipelineManager.makeTaskItem(pathToExecutable: udpSenderPath, functionName: "PCMUDPSender")
@@ -106,18 +117,14 @@ public final class AirPlayReceiverController {
 
         do {
             try pipelineManager.start()
-            isRunning = true
-            lastError = nil
         } catch {
-            lastError = error
-            isRunning = false
+            preflightError = error
         }
     }
 
     public func stop() {
         guard pipelineManager.status == .running else { return }
         pipelineManager.terminate()
-        isRunning = false
     }
 
     /// Applies a new configuration, restarting the receiver if it was running.
@@ -136,7 +143,7 @@ public final class AirPlayReceiverController {
         do {
             item = try pipelineManager.makeSoxTaskItem()
         } catch {
-            lastError = error
+            preflightError = error
             return nil
         }
 
