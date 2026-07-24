@@ -54,12 +54,14 @@ Classic AirPlay (non-AirPlay-2) builds of shairport-sync hard-code RTSP port
 `CONFIG_AIRPLAY_2` isn't compiled in — a `--port`/config-file override has no
 effect). Only one process on a Mac can hold that port.
 
-**macOS's own built-in AirPlay Receiver** (System Settings → General → AirDrop
-& Handoff → AirPlay Receiver) also listens on port 5000 via Control Center when
-enabled. If it's on, this package's `shairport-sync` will fail to start with
-`could not establish a service on port 5000`. Users who want ControlBooth or
-AntennaHead to act as an AirPlay speaker need to turn macOS's built-in AirPlay
-Receiver **off** first.
+Only **one** process on a Mac can hold port 5000 — this means at most one of
+the following can be active at a time: macOS's own built-in AirPlay Receiver
+(System Settings → General → AirDrop & Handoff → AirPlay Receiver), ControlBooth's
+receiver, or AntennaHead's receiver. Whichever starts first wins; the other(s)
+fail to bind with `could not establish a service on port 5000` (safe failure —
+`AirPlayReceiverController` tears itself down cleanly with no orphaned
+processes, surfaced via `lastError`, but neither app currently treats it as
+fatal). Confirmed by testing both apps' receivers enabled simultaneously.
 
 ## Regenerating the vendored binary
 
