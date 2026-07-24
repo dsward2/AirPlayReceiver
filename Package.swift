@@ -1,0 +1,48 @@
+// swift-tools-version: 5.9
+import PackageDescription
+
+// AirPlayReceiver — a shared AirPlay 1 (RAOP) audio-receiver package for
+// AntennaHead and ControlBooth.
+//
+// Wraps a vendored `shairport-sync` binary (classic AirPlay 1 only — AirPlay 2
+// isn't supported on macOS by shairport-sync itself) and feeds its decoded PCM
+// into the same pipeline architecture the two apps already use for rtl_fm:
+//
+//     shairport-sync (--output=stdout)  ->  sox (resample 44100 -> 48000)  ->  PCMUDPSender
+//
+// built with PipelineHelpers' TaskItem/TaskPipelineManager, exactly like
+// AntennaHead's SDRController assembles its rtl_fm chain.
+let package = Package(
+    name: "AirPlayReceiver",
+    platforms: [
+        // AirPlayReceiverController uses @Observable (Observation framework),
+        // matching PipelineHelpers' own minimum.
+        .macOS(.v14)
+    ],
+    products: [
+        .library(name: "AirPlayReceiver", targets: ["AirPlayReceiver"])
+    ],
+    dependencies: [
+        .package(url: "https://github.com/dsward2/PipelineHelpers", branch: "main")
+    ],
+    targets: [
+        .target(
+            name: "AirPlayReceiver",
+            dependencies: [
+                .product(name: "PipelineRunner", package: "PipelineHelpers")
+            ],
+            resources: [
+                // The vendored shairport-sync binary plus a Frameworks/
+                // subfolder of its bundled dylibs (install names rewritten to
+                // @executable_path/../Frameworks/..., matching the same
+                // convention AntennaHead already uses for its own vendored
+                // dylibs). Regenerate with scripts/build-shairport-sync.sh.
+                .copy("Resources")
+            ]
+        ),
+        .testTarget(
+            name: "AirPlayReceiverTests",
+            dependencies: ["AirPlayReceiver"]
+        )
+    ]
+)

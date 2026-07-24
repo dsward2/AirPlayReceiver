@@ -1,0 +1,159 @@
+import Foundation
+import Observation
+import PipelineRunner
+
+/// Runs a vendored `shairport-sync` (AirPlay 1 / RAOP) helper and forwards its
+/// decoded PCM to a UDP destination, for embedding in a host app's own audio
+/// pipeline.
+///
+///     shairport-sync (--output=stdout, 44100 Hz/16-bit/stereo)
+///       -> sox (resample to 48000 Hz)
+///       -> PCMUDPSender (--host --port --exit-with-parent)
+///
+/// built with `TaskPipelineManager`/`TaskItem` from PipelineHelpers, the same
+/// way AntennaHead's `SDRController` assembles its rtl_fm chain. Callers embed
+/// this package's `Resources/shairport-sync` binary in their app bundle's
+/// `Contents/Helpers/` (see the package README) so it resolves the same way
+/// every other pipeline helper does.
+@MainActor
+@Observable
+public final class AirPlayReceiverController {
+    public struct Configuration {
+        public var deviceName: String
+        public var udpHost: String
+        public var udpPort: UInt16
+        public var password: String?
+
+        public init(deviceName: String, udpHost: String = "127.0.0.1", udpPort: UInt16, password: String? = nil) {
+            self.deviceName = deviceName
+            self.udpHost = udpHost
+            self.udpPort = udpPort
+            self.password = password
+        }
+    }
+
+    public enum AirPlayReceiverError: Error, CustomStringConvertible {
+        case executableMissing(String)
+        case startFailed(String)
+
+        public var description: String {
+            switch self {
+            case .executableMissing(let path): return "shairport-sync executable not found at \(path)."
+            case .startFailed(let m): return "AirPlay receiver failed to start: \(m)"
+            }
+        }
+    }
+
+    /// PCM format shairport-sync emits on its stdout output backend.
+    private static let inputSampleRate = 44_100
+    private static let inputChannels = 2
+    /// Output format matching LiveAudioServer's UDP-input contract (see
+    /// LiveAudioServerProcessManager in AntennaHead).
+    private static let outputSampleRate = 48_000
+    private static let outputChannels = 2
+
+    public private(set) var isRunning = false
+    public private(set) var lastError: Error?
+
+    private var configuration: Configuration
+    private let pipelineManager = TaskPipelineManager()
+
+    public init(configuration: Configuration) {
+        self.configuration = configuration
+    }
+
+    /// Resolves the vendored `shairport-sync` helper embedded in the host app's
+    /// bundle, matching every other pipeline helper's lookup convention.
+    public static var shairportSyncExecutableURL: URL {
+        Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/shairport-sync")
+    }
+
+    public func start() {
+        stop()
+
+        let executablePath = Self.shairportSyncExecutableURL.path
+        guard FileManager.default.isExecutableFile(atPath: executablePath) else {
+            lastError = AirPlayReceiverError.executableMissing(executablePath)
+            return
+        }
+
+        let receiver = pipelineManager.makeTaskItem(pathToExecutable: executablePath, functionName: "shairport-sync")
+        for arg in ShairportSyncArguments.make(deviceName: configuration.deviceName, password: configuration.password) {
+            receiver.addArgument(arg)
+        }
+
+        guard let resample = makeResampleTaskItem() else {
+            return  // lastError already set by the failing builder
+        }
+
+        let udpSender: TaskItem
+        do {
+            udpSender = try pipelineManager.makeTaskItem(executableName: "PCMUDPSender", functionName: "PCMUDPSender")
+        } catch {
+            lastError = error
+            return
+        }
+        udpSender.addArgument("--host"); udpSender.addArgument(configuration.udpHost)
+        udpSender.addArgument("--port"); udpSender.addArgument(Int(configuration.udpPort))
+        udpSender.addArgument("--exit-with-parent")
+
+        pipelineManager.add(receiver)
+        pipelineManager.add(resample)
+        pipelineManager.add(udpSender)
+
+        do {
+            try pipelineManager.start()
+            isRunning = true
+            lastError = nil
+        } catch {
+            lastError = error
+            isRunning = false
+        }
+    }
+
+    public func stop() {
+        guard pipelineManager.status == .running else { return }
+        pipelineManager.terminate()
+        isRunning = false
+    }
+
+    /// Applies a new configuration, restarting the receiver if it was running.
+    public func updateConfiguration(_ newConfiguration: Configuration) {
+        let wasRunning = isRunning
+        configuration = newConfiguration
+        if wasRunning {
+            start()
+        }
+    }
+
+    /// sox stage: resamples shairport-sync's fixed 44100 Hz/stereo stdout to
+    /// the 48000 Hz/2-channel LiveAudioServer UDP-input contract.
+    private func makeResampleTaskItem() -> TaskItem? {
+        let item: TaskItem
+        do {
+            item = try pipelineManager.makeSoxTaskItem()
+        } catch {
+            lastError = error
+            return nil
+        }
+
+        item.addArgument("-V2")
+        item.addArgument("-q")
+
+        item.addArgument("-r"); item.addArgument(Self.inputSampleRate)
+        item.addArgument("-e"); item.addArgument("signed-integer")
+        item.addArgument("-b"); item.addArgument(16)
+        item.addArgument("-c"); item.addArgument(Self.inputChannels)
+        item.addArgument("-t"); item.addArgument("raw")
+        item.addArgument("-")
+
+        item.addArgument("-e"); item.addArgument("signed-integer")
+        item.addArgument("-b"); item.addArgument(16)
+        item.addArgument("-c"); item.addArgument(Self.outputChannels)
+        item.addArgument("-t"); item.addArgument("raw")
+        item.addArgument("-")
+
+        item.addArgument("rate"); item.addArgument(Self.outputSampleRate)
+        return item
+    }
+}

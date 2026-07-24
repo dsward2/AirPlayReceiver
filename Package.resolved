@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "pipelinehelpers",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/dsward2/PipelineHelpers",
+      "state" : {
+        "branch" : "main",
+        "revision" : "3dfcf31686cff5494bbc66e3b03a8f1535d2b2b5"
+      }
+    }
+  ],
+  "version" : 2
+}
