@@ -86,13 +86,16 @@ public final class AirPlayReceiverController {
             return  // lastError already set by the failing builder
         }
 
-        let udpSender: TaskItem
-        do {
-            udpSender = try pipelineManager.makeTaskItem(executableName: "PCMUDPSender", functionName: "PCMUDPSender")
-        } catch {
-            lastError = error
+        // Resolved the same way every other pipeline helper is (SDRController,
+        // ControlBooth's PipelineRunner): Bundle.main.path(forAuxiliaryExecutable:)
+        // — used by TaskPipelineManager.makeTaskItem(executableName:) — does not
+        // reliably find Contents/Helpers executables, so build the path directly.
+        let udpSenderPath = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/PCMUDPSender").path
+        guard FileManager.default.isExecutableFile(atPath: udpSenderPath) else {
+            lastError = AirPlayReceiverError.executableMissing(udpSenderPath)
             return
         }
+        let udpSender = pipelineManager.makeTaskItem(pathToExecutable: udpSenderPath, functionName: "PCMUDPSender")
         udpSender.addArgument("--host"); udpSender.addArgument(configuration.udpHost)
         udpSender.addArgument("--port"); udpSender.addArgument(Int(configuration.udpPort))
         udpSender.addArgument("--exit-with-parent")
