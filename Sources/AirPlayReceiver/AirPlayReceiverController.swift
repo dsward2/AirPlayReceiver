@@ -67,6 +67,9 @@ public final class AirPlayReceiverController {
     private var preflightError: Error?
     private var configuration: Configuration
     private let pipelineManager = TaskPipelineManager()
+    /// Pending async launch; cancelled and replaced on each new `start()` call so
+    /// rapid successive calls never race to start two pipeline instances at once.
+    private var startTask: Task<Void, Never>?
 
     public init(configuration: Configuration) {
         self.configuration = configuration
@@ -79,7 +82,79 @@ public final class AirPlayReceiverController {
     }
 
     public func start() {
+        // Capture dying process references before stop() clears them, so the
+        // async wait below can confirm they've released OS resources (port 5000)
+        // before the new pipeline tries to bind the same port.
+        let dyingProcesses = pipelineManager.taskItems.compactMap { $0.process }.filter { $0.isRunning }
         stop()
+
+        startTask?.cancel()
+        startTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            if !dyingProcesses.isEmpty {
+                await Self.waitForExit(dyingProcesses, timeout: 2.5)
+                guard !Task.isCancelled else { return }
+            }
+            await Self.waitForTCPPortFree(5000)
+            guard !Task.isCancelled else { return }
+            self.launchPipeline()
+        }
+    }
+
+    public func stop() {
+        startTask?.cancel()
+        startTask = nil
+        guard pipelineManager.status == .running else { return }
+        pipelineManager.terminate()
+    }
+
+    /// Waits (non-blocking) for all processes to exit, then SIGKILLs any that
+    /// outlast the timeout. Ensures port 5000 is free before a replacement
+    /// shairport-sync tries to bind it.
+    private static func waitForExit(_ processes: [Process], timeout: TimeInterval) async {
+        var alive = processes.filter { $0.isRunning }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !alive.isEmpty && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            alive = alive.filter { $0.isRunning }
+        }
+        for proc in alive {
+            kill(proc.processIdentifier, SIGKILL)
+        }
+        if !alive.isEmpty {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// Polls until TCP port is available to bind, up to `timeout` seconds.
+    private static func waitForTCPPortFree(_ port: UInt16, timeout: TimeInterval = 2.0) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !isTCPPortFree(port) && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if !isTCPPortFree(port) {
+            print("AirPlayReceiverController: TCP port \(port) still in use after \(timeout)s; proceeding anyway")
+        }
+    }
+
+    private static func isTCPPortFree(_ port: UInt16) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { return true }
+        defer { close(sock) }
+        var reuseAddr: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = 0
+        return withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+    }
+
+    private func launchPipeline() {
         preflightError = nil
 
         let executablePath = Self.shairportSyncExecutableURL.path
@@ -122,11 +197,6 @@ public final class AirPlayReceiverController {
         }
     }
 
-    public func stop() {
-        guard pipelineManager.status == .running else { return }
-        pipelineManager.terminate()
-    }
-
     /// Applies a new configuration, restarting the receiver if it was running.
     public func updateConfiguration(_ newConfiguration: Configuration) {
         let wasRunning = isRunning
@@ -149,6 +219,14 @@ public final class AirPlayReceiverController {
 
         item.addArgument("-V2")
         item.addArgument("-q")
+
+        // Without an explicit --buffer, sox falls back to its default (large
+        // enough to add several hundred ms of latency at this rate), which
+        // shows up as sluggishness switching to/resuming AirPlay playback.
+        // Size it for ~50 ms of audio instead, matching SDRController's radio
+        // pipeline (see its makeResampleTaskItem for the same rationale).
+        let blockBytes = max(1024, Self.inputSampleRate * Self.inputChannels * 2 / 20)
+        item.addArgument("--buffer"); item.addArgument(blockBytes)
 
         item.addArgument("-r"); item.addArgument(Self.inputSampleRate)
         item.addArgument("-e"); item.addArgument("signed-integer")
