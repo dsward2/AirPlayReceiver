@@ -71,6 +71,14 @@ public final class AirPlayReceiverController {
     /// rapid successive calls never race to start two pipeline instances at once.
     private var startTask: Task<Void, Never>?
 
+    /// Forwards this controller's own diagnostic messages plus its pipeline
+    /// stages' relayed stderr (source = each stage's `functionName`), so a
+    /// host app can pipe AirPlay receiver activity into its own logging
+    /// system without this package depending on a concrete log type.
+    public var onLog: ((_ source: String, _ message: String) -> Void)? {
+        didSet { pipelineManager.onLog = onLog }
+    }
+
     public init(configuration: Configuration) {
         self.configuration = configuration
     }
@@ -95,7 +103,7 @@ public final class AirPlayReceiverController {
                 await Self.waitForExit(dyingProcesses, timeout: 2.5)
                 guard !Task.isCancelled else { return }
             }
-            await Self.waitForTCPPortFree(5000)
+            await Self.waitForTCPPortFree(5000, onLog: self.onLog)
             guard !Task.isCancelled else { return }
             self.launchPipeline()
         }
@@ -127,13 +135,16 @@ public final class AirPlayReceiverController {
     }
 
     /// Polls until TCP port is available to bind, up to `timeout` seconds.
-    private static func waitForTCPPortFree(_ port: UInt16, timeout: TimeInterval = 2.0) async {
+    private static func waitForTCPPortFree(_ port: UInt16, timeout: TimeInterval = 2.0,
+                                           onLog: ((_ source: String, _ message: String) -> Void)? = nil) async {
         let deadline = Date().addingTimeInterval(timeout)
         while !isTCPPortFree(port) && Date() < deadline {
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
         if !isTCPPortFree(port) {
-            print("AirPlayReceiverController: TCP port \(port) still in use after \(timeout)s; proceeding anyway")
+            let message = "TCP port \(port) still in use after \(timeout)s; proceeding anyway"
+            print("AirPlayReceiverController: \(message)")
+            onLog?("AirPlayReceiverController", message)
         }
     }
 
