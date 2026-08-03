@@ -1,5 +1,6 @@
 // swift-tools-version: 5.9
 import PackageDescription
+import Foundation
 
 // AirPlayReceiver — a shared AirPlay 1 (RAOP) audio-receiver package for
 // AntennaHead and ControlBooth.
@@ -12,6 +13,14 @@ import PackageDescription
 //
 // built with PipelineHelpers' TaskItem/TaskPipelineManager, exactly like
 // AntennaHead's SDRController assembles its rtl_fm chain.
+
+// Use the local PipelineHelpers sibling when building from the umbrella monorepo;
+// fall back to GitHub when used standalone.
+let pipelineHelpersDep: Package.Dependency = FileManager.default.fileExists(
+    atPath: "../PipelineHelpers/Package.swift"
+) ? .package(path: "../PipelineHelpers")
+  : .package(url: "https://github.com/dsward2/PipelineHelpers", branch: "main")
+
 let package = Package(
     name: "AirPlayReceiver",
     platforms: [
@@ -23,7 +32,7 @@ let package = Package(
         .library(name: "AirPlayReceiver", targets: ["AirPlayReceiver"])
     ],
     dependencies: [
-        .package(url: "https://github.com/dsward2/PipelineHelpers", branch: "main")
+        pipelineHelpersDep,
     ],
     targets: [
         .target(
