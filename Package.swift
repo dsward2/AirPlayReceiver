@@ -16,8 +16,11 @@ import Foundation
 
 // Use the local PipelineHelpers sibling when building from the umbrella monorepo;
 // fall back to GitHub when used standalone.
+// Use #file (absolute path to this manifest) so the sibling check works regardless
+// of what directory SwiftPM sets as CWD during manifest evaluation.
+let _manifestDir = URL(fileURLWithPath: #file).deletingLastPathComponent()
 let pipelineHelpersDep: Package.Dependency = FileManager.default.fileExists(
-    atPath: "../PipelineHelpers/Package.swift"
+    atPath: _manifestDir.appendingPathComponent("../PipelineHelpers/Package.swift").standardized.path
 ) ? .package(path: "../PipelineHelpers")
   : .package(url: "https://github.com/dsward2/PipelineHelpers", branch: "main")
 
