@@ -38,6 +38,18 @@ public final class AirPlayReceiverController {
         }
     }
 
+    /// Current track's title/artist, from shairport-sync's metadata pipe
+    /// (`--with-metadata`). `nil` when nothing is known (no session, or
+    /// metadata not yet received for the current one).
+    public struct NowPlayingTrack: Equatable, Sendable {
+        public var title: String?
+        public var artist: String?
+        public init(title: String? = nil, artist: String? = nil) {
+            self.title = title
+            self.artist = artist
+        }
+    }
+
     public enum AirPlayReceiverError: Error, CustomStringConvertible {
         case executableMissing(String)
         case startFailed(String)
@@ -87,6 +99,13 @@ public final class AirPlayReceiverController {
     /// marker file shairport-sync's `-B`/`-E` hooks touch/remove — see
     /// `startSessionMarkerPolling`.
     public private(set) var isReceivingAudio = false
+    /// See `NowPlayingTrack`. Updated live as shairport-sync's metadata pipe
+    /// reports items; cleared when the current session ends.
+    public private(set) var nowPlayingTrack: NowPlayingTrack?
+    /// Fires whenever `nowPlayingTrack` actually changes (including to/from
+    /// `nil`), so a host app can push the update elsewhere (e.g. ControlBooth
+    /// announcing it to AntennaHead) without polling.
+    public var onNowPlayingChange: ((NowPlayingTrack?) -> Void)?
 
     private var preflightError: Error?
     private var configuration: Configuration
@@ -101,6 +120,15 @@ public final class AirPlayReceiverController {
     /// exact path, so a stale poll from a previous launch can't read a marker
     /// left behind (or missing) from the wrong process generation.
     private var currentSessionMarkerPath: String?
+    /// The metadata FIFO's `readabilityHandler`; torn down and recreated with
+    /// each launch alongside the session marker poll.
+    private var metadataFileHandle: FileHandle?
+    private var currentMetadataPipePath: String?
+    /// Title/artist accumulate independently as shairport-sync's metadata
+    /// pipe reports each one separately; combined into `nowPlayingTrack`
+    /// (and the change callback) after each update.
+    private var pendingTrackTitle: String?
+    private var pendingTrackArtist: String?
 
     /// Forwards this controller's own diagnostic messages plus its pipeline
     /// stages' relayed stderr (source = each stage's `functionName`), so a
@@ -145,6 +173,7 @@ public final class AirPlayReceiverController {
         startTask?.cancel()
         startTask = nil
         stopSessionMarkerPolling()
+        stopMetadataPipeReading()
         guard pipelineManager.status == .running else { return }
         pipelineManager.terminate()
     }
@@ -192,6 +221,13 @@ public final class AirPlayReceiverController {
                 let exists = FileManager.default.fileExists(atPath: path)
                 if exists != self.isReceivingAudio {
                     self.isReceivingAudio = exists
+                    // A session just ended: clear stale title/artist rather
+                    // than leaving the last-played track showing while idle.
+                    if !exists {
+                        self.pendingTrackTitle = nil
+                        self.pendingTrackArtist = nil
+                        self.updateNowPlayingTrack()
+                    }
                 }
                 try? await Task.sleep(nanoseconds: Self.sessionMarkerPollInterval)
             }
@@ -206,6 +242,135 @@ public final class AirPlayReceiverController {
             try? FileManager.default.removeItem(atPath: currentSessionMarkerPath)
         }
         currentSessionMarkerPath = nil
+    }
+
+    /// Opens shairport-sync's metadata FIFO (created here, before launch —
+    /// see `launchPipeline`'s `mkfifo` — rather than left to shairport-sync,
+    /// so it's guaranteed to exist the instant this reads from it) and wires
+    /// a `readabilityHandler` that extracts `<item>...</item>` blocks as they
+    /// arrive. Opened `O_NONBLOCK` so this never blocks the caller waiting
+    /// for shairport-sync to open its write end (which happens moments later,
+    /// once the pipeline is actually running).
+    ///
+    /// Item format (undocumented but stable across shairport-sync releases):
+    /// `<item><type>HEX</type><code>HEX</code><length>N</length>[<data
+    /// encoding="base64">B64</data>]</item>`, where `type`/`code` are
+    /// hex-encoded 4-character tags — e.g. `type=core` (`636f7265`),
+    /// `code=minm` (`6d696e6d`, track title) or `asar` (artist). Only those
+    /// two are currently used; everything else (album, genre, ssnc/* control
+    /// markers, artwork, …) is ignored.
+    private func startMetadataPipeReading(path: String) {
+        pendingTrackTitle = nil
+        pendingTrackArtist = nil
+        let fd = open(path, O_RDONLY | O_NONBLOCK)
+        guard fd >= 0 else {
+            onLog?("AirPlayReceiverController", "open() failed for metadata pipe at \(path): \(String(cString: strerror(errno)))")
+            return
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        metadataFileHandle = handle
+        let buffer = MetadataItemBuffer()
+        handle.readabilityHandler = { [weak self] h in
+            let data = h.availableData
+            guard !data.isEmpty else { return }
+            let items = buffer.appendAndExtractItems(data)
+            guard !items.isEmpty else { return }
+            Task { @MainActor in
+                for item in items {
+                    self?.handleMetadataItem(item)
+                }
+            }
+        }
+    }
+
+    private func stopMetadataPipeReading() {
+        metadataFileHandle?.readabilityHandler = nil
+        try? metadataFileHandle?.close()
+        metadataFileHandle = nil
+        if let currentMetadataPipePath {
+            unlink(currentMetadataPipePath)
+        }
+        currentMetadataPipePath = nil
+        pendingTrackTitle = nil
+        pendingTrackArtist = nil
+        updateNowPlayingTrack()
+    }
+
+    private func handleMetadataItem(_ text: String) {
+        guard let typeHex = Self.extractTag("type", from: text),
+              let codeHex = Self.extractTag("code", from: text) else { return }
+        guard Self.hexToASCII(typeHex) == "core" else { return }
+        let code = Self.hexToASCII(codeHex)
+        guard code == "minm" || code == "asar" else { return }
+        let value = Self.extractBase64Data(from: text)
+            .flatMap { Data(base64Encoded: $0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
+        if code == "minm" {
+            pendingTrackTitle = value
+        } else {
+            pendingTrackArtist = value
+        }
+        updateNowPlayingTrack()
+    }
+
+    private func updateNowPlayingTrack() {
+        let newValue: NowPlayingTrack? = (pendingTrackTitle != nil || pendingTrackArtist != nil)
+            ? NowPlayingTrack(title: pendingTrackTitle, artist: pendingTrackArtist) : nil
+        guard newValue != nowPlayingTrack else { return }
+        nowPlayingTrack = newValue
+        onNowPlayingChange?(newValue)
+    }
+
+    private static func extractTag(_ tag: String, from text: String) -> String? {
+        guard let open = text.range(of: "<\(tag)>"),
+              let close = text.range(of: "</\(tag)>", range: open.upperBound..<text.endIndex) else { return nil }
+        return String(text[open.upperBound..<close.lowerBound])
+    }
+
+    private static func extractBase64Data(from text: String) -> String? {
+        guard let open = text.range(of: "<data encoding=\"base64\">"),
+              let close = text.range(of: "</data>", range: open.upperBound..<text.endIndex) else { return nil }
+        return String(text[open.upperBound..<close.lowerBound])
+    }
+
+    private static func hexToASCII(_ hex: String) -> String {
+        var result = ""
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+            if let byte = UInt8(hex[index..<next], radix: 16) {
+                result.append(Character(Unicode.Scalar(byte)))
+            }
+            index = next
+        }
+        return result
+    }
+
+    /// Accumulates bytes from the metadata pipe's `readabilityHandler`
+    /// (invoked off the main actor) and extracts complete `<item>...</item>`
+    /// blocks — same locked-buffer approach `TaskPipelineManager` uses for
+    /// stderr line buffering, and for the same reason (a plain captured `var`
+    /// mutated from that closure is a Swift 6 concurrency error, not just a
+    /// style warning).
+    private final class MetadataItemBuffer: @unchecked Sendable {
+        private var data = Data()
+        private let lock = NSLock()
+        private static let terminator = Data("</item>".utf8)
+
+        func appendAndExtractItems(_ newData: Data) -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            data.append(newData)
+            var items: [String] = []
+            while let range = data.range(of: Self.terminator) {
+                let itemData = data.subdata(in: data.startIndex..<range.upperBound)
+                data.removeSubrange(data.startIndex..<range.upperBound)
+                if let text = String(data: itemData, encoding: .utf8) {
+                    items.append(text)
+                }
+            }
+            return items
+        }
     }
 
     /// Waits (non-blocking) for all processes to exit, then SIGKILLs any that
@@ -268,10 +433,34 @@ public final class AirPlayReceiverController {
 
         let sessionMarkerPath = NSTemporaryDirectory()
             .appending("airplay-receiver-session-\(UUID().uuidString).active")
+        let metadataPipePath = NSTemporaryDirectory()
+            .appending("airplay-receiver-metadata-\(UUID().uuidString).pipe")
+        // Created here rather than left to shairport-sync so it's guaranteed
+        // to exist before startMetadataPipeReading() opens it below. A
+        // failure here is non-fatal to the receiver as a whole — audio still
+        // works without a metadata pipe, so just skip that part rather than
+        // failing the whole launch.
+        unlink(metadataPipePath)
+        let metadataPipeCreated = mkfifo(metadataPipePath, 0o600) == 0
+        if !metadataPipeCreated {
+            onLog?("AirPlayReceiverController",
+                   "mkfifo failed for metadata pipe at \(metadataPipePath): \(String(cString: strerror(errno))) — track metadata will be unavailable this session")
+        } else {
+            // Open *our* read end before shairport-sync ever launches, not
+            // after: shairport-sync opens its write end non-blocking at
+            // startup and, per POSIX FIFO semantics, a non-blocking open for
+            // writing fails outright (ENXIO) if no reader is attached yet —
+            // it doesn't retry later. Opening late here meant every session's
+            // metadata silently vanished for the entire run, confirmed by
+            // tapping the raw pipe live (a continuously looping playlist
+            // produced zero bytes for the whole session on the old ordering).
+            currentMetadataPipePath = metadataPipePath
+            startMetadataPipeReading(path: metadataPipePath)
+        }
 
         let receiver = pipelineManager.makeTaskItem(pathToExecutable: executablePath, functionName: "shairport-sync")
         for arg in ShairportSyncArguments.make(deviceName: configuration.deviceName, password: configuration.password,
-                                               sessionMarkerPath: sessionMarkerPath) {
+                                               sessionMarkerPath: sessionMarkerPath, metadataPipePath: metadataPipePath) {
             receiver.addArgument(arg)
         }
 
@@ -303,6 +492,7 @@ public final class AirPlayReceiverController {
             try pipelineManager.start()
         } catch {
             preflightError = error
+            stopMetadataPipeReading()
             return
         }
         currentSessionMarkerPath = sessionMarkerPath
