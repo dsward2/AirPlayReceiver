@@ -3,17 +3,27 @@ import XCTest
 
 final class ShairportSyncArgumentsTests: XCTestCase {
     func testBasicArgumentsIncludeDeviceName() {
-        let args = ShairportSyncArguments.make(deviceName: "Test Speaker", password: nil)
-        XCTAssertEqual(args, ["-a", "Test Speaker", "-o", "stdout"])
+        let args = ShairportSyncArguments.make(deviceName: "Test Speaker", password: nil,
+                                               sessionMarkerPath: "/tmp/marker")
+        XCTAssertEqual(args, ["-a", "Test Speaker", "-o", "stdout",
+                              "-B", "/usr/bin/touch '/tmp/marker'",
+                              "-E", "/bin/rm -f '/tmp/marker'"])
     }
 
     func testPasswordIsAppendedWhenNonEmpty() {
-        let args = ShairportSyncArguments.make(deviceName: "Test Speaker", password: "secret")
-        XCTAssertEqual(args, ["-a", "Test Speaker", "-o", "stdout", "--password", "secret"])
+        let args = ShairportSyncArguments.make(deviceName: "Test Speaker", password: "secret",
+                                               sessionMarkerPath: "/tmp/marker")
+        XCTAssertEqual(args, ["-a", "Test Speaker", "-o", "stdout",
+                              "-B", "/usr/bin/touch '/tmp/marker'",
+                              "-E", "/bin/rm -f '/tmp/marker'",
+                              "--password", "secret"])
     }
 
     func testEmptyPasswordIsOmitted() {
-        let args = ShairportSyncArguments.make(deviceName: "Test Speaker", password: "")
-        XCTAssertEqual(args, ["-a", "Test Speaker", "-o", "stdout"])
+        let args = ShairportSyncArguments.make(deviceName: "Test Speaker", password: "",
+                                               sessionMarkerPath: "/tmp/marker")
+        XCTAssertEqual(args, ["-a", "Test Speaker", "-o", "stdout",
+                              "-B", "/usr/bin/touch '/tmp/marker'",
+                              "-E", "/bin/rm -f '/tmp/marker'"])
     }
 }

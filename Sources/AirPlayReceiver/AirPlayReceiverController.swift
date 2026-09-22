@@ -23,12 +23,18 @@ public final class AirPlayReceiverController {
         public var udpHost: String
         public var udpPort: UInt16
         public var password: String?
+        /// Initial relay state the PCMUDPSender stage launches with. Live
+        /// toggles after launch go through `setRelayEnabled(_:)`, not a
+        /// reconfigure — see that method's doc comment.
+        public var relayEnabled: Bool
 
-        public init(deviceName: String, udpHost: String = "127.0.0.1", udpPort: UInt16, password: String? = nil) {
+        public init(deviceName: String, udpHost: String = "127.0.0.1", udpPort: UInt16, password: String? = nil,
+                    relayEnabled: Bool = true) {
             self.deviceName = deviceName
             self.udpHost = udpHost
             self.udpPort = udpPort
             self.password = password
+            self.relayEnabled = relayEnabled
         }
     }
 
@@ -51,6 +57,13 @@ public final class AirPlayReceiverController {
     /// LiveAudioServerProcessManager in AntennaHead).
     private static let outputSampleRate = 48_000
     private static let outputChannels = 2
+    /// Local-only UDP port PCMUDPSender's `--control-port` binds, for live
+    /// relay mute/unmute (see `setRelayEnabled`). Fixed rather than
+    /// negotiated: this socket never leaves the host and nothing else in
+    /// this process tree uses it.
+    private static let relayControlPort: UInt16 = 6029
+    /// How often `isReceivingAudio` re-checks the session marker file.
+    private static let sessionMarkerPollInterval: UInt64 = 1_000_000_000
 
     /// Reflects the pipeline manager's live state rather than a snapshot taken
     /// at `start()` — otherwise a stage that dies later (e.g. shairport-sync
@@ -64,12 +77,30 @@ public final class AirPlayReceiverController {
         }
     }
 
+    /// Whether the currently-running (or about-to-run) PCMUDPSender stage is
+    /// forwarding to `configuration.udpHost`/`udpPort`. Changed live via
+    /// `setRelayEnabled(_:)`, independent of `isRunning`/`stop()`/`start()` —
+    /// shairport-sync stays connected to its AirPlay source the whole time.
+    public private(set) var relayEnabled: Bool
+    /// Whether an AirPlay client is actively streaming right now (as opposed
+    /// to just connected/idle, or nothing connected at all). Polled from a
+    /// marker file shairport-sync's `-B`/`-E` hooks touch/remove — see
+    /// `startSessionMarkerPolling`.
+    public private(set) var isReceivingAudio = false
+
     private var preflightError: Error?
     private var configuration: Configuration
     private let pipelineManager = TaskPipelineManager()
     /// Pending async launch; cancelled and replaced on each new `start()` call so
     /// rapid successive calls never race to start two pipeline instances at once.
     private var startTask: Task<Void, Never>?
+    /// Polls `currentSessionMarkerPath` for `isReceivingAudio`; cancelled and
+    /// restarted with each `launchPipeline()`, cancelled outright in `stop()`.
+    private var sessionMarkerPollTask: Task<Void, Never>?
+    /// Unique per launch — shairport-sync's `-B`/`-E` hooks touch/remove this
+    /// exact path, so a stale poll from a previous launch can't read a marker
+    /// left behind (or missing) from the wrong process generation.
+    private var currentSessionMarkerPath: String?
 
     /// Forwards this controller's own diagnostic messages plus its pipeline
     /// stages' relayed stderr (source = each stage's `functionName`), so a
@@ -81,6 +112,7 @@ public final class AirPlayReceiverController {
 
     public init(configuration: Configuration) {
         self.configuration = configuration
+        self.relayEnabled = configuration.relayEnabled
     }
 
     /// Resolves the vendored `shairport-sync` helper embedded in the host app's
@@ -112,8 +144,68 @@ public final class AirPlayReceiverController {
     public func stop() {
         startTask?.cancel()
         startTask = nil
+        stopSessionMarkerPolling()
         guard pipelineManager.status == .running else { return }
         pipelineManager.terminate()
+    }
+
+    /// Mutes or unmutes the PCMUDPSender stage without restarting anything —
+    /// shairport-sync stays connected to its AirPlay source and sox keeps
+    /// resampling the whole time, so toggling this produces no audio glitch
+    /// or reconnect on the AirPlay client's end. A no-op (beyond updating the
+    /// published state, so a subsequent `start()`/`updateConfiguration` picks
+    /// up the requested value) when nothing is running yet.
+    public func setRelayEnabled(_ enabled: Bool) {
+        relayEnabled = enabled
+        configuration.relayEnabled = enabled
+        guard isRunning else { return }
+        Self.sendControlCommand(enabled ? "relay on" : "relay off", port: Self.relayControlPort)
+    }
+
+    /// Fire-and-forget UDP send to PCMUDPSender's `--control-port`, same
+    /// raw-socket style as `isTCPPortFree` below.
+    private static func sendControlCommand(_ text: String, port: UInt16) {
+        let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard sock >= 0 else { return }
+        defer { close(sock) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        guard inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1 else { return }
+        _ = text.withCString { cString in
+            withUnsafePointer(to: &addr) { rawAddr in
+                rawAddr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockAddr in
+                    sendto(sock, cString, strlen(cString), 0, sockAddr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+    }
+
+    /// Starts (re)polling `path` for `isReceivingAudio`, replacing any poll
+    /// left over from a previous launch.
+    private func startSessionMarkerPolling(path: String) {
+        sessionMarkerPollTask?.cancel()
+        isReceivingAudio = false
+        sessionMarkerPollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let exists = FileManager.default.fileExists(atPath: path)
+                if exists != self.isReceivingAudio {
+                    self.isReceivingAudio = exists
+                }
+                try? await Task.sleep(nanoseconds: Self.sessionMarkerPollInterval)
+            }
+        }
+    }
+
+    private func stopSessionMarkerPolling() {
+        sessionMarkerPollTask?.cancel()
+        sessionMarkerPollTask = nil
+        isReceivingAudio = false
+        if let currentSessionMarkerPath {
+            try? FileManager.default.removeItem(atPath: currentSessionMarkerPath)
+        }
+        currentSessionMarkerPath = nil
     }
 
     /// Waits (non-blocking) for all processes to exit, then SIGKILLs any that
@@ -174,8 +266,12 @@ public final class AirPlayReceiverController {
             return
         }
 
+        let sessionMarkerPath = NSTemporaryDirectory()
+            .appending("airplay-receiver-session-\(UUID().uuidString).active")
+
         let receiver = pipelineManager.makeTaskItem(pathToExecutable: executablePath, functionName: "shairport-sync")
-        for arg in ShairportSyncArguments.make(deviceName: configuration.deviceName, password: configuration.password) {
+        for arg in ShairportSyncArguments.make(deviceName: configuration.deviceName, password: configuration.password,
+                                               sessionMarkerPath: sessionMarkerPath) {
             receiver.addArgument(arg)
         }
 
@@ -196,6 +292,8 @@ public final class AirPlayReceiverController {
         udpSender.addArgument("--host"); udpSender.addArgument(configuration.udpHost)
         udpSender.addArgument("--port"); udpSender.addArgument(Int(configuration.udpPort))
         udpSender.addArgument("--exit-with-parent")
+        udpSender.addArgument("--control-port"); udpSender.addArgument(Int(Self.relayControlPort))
+        udpSender.addArgument("--relay"); udpSender.addArgument(configuration.relayEnabled ? "on" : "off")
 
         pipelineManager.add(receiver)
         pipelineManager.add(resample)
@@ -205,13 +303,21 @@ public final class AirPlayReceiverController {
             try pipelineManager.start()
         } catch {
             preflightError = error
+            return
         }
+        currentSessionMarkerPath = sessionMarkerPath
+        startSessionMarkerPolling(path: sessionMarkerPath)
     }
 
-    /// Applies a new configuration, restarting the receiver if it was running.
+    /// Applies a new configuration, restarting the receiver if it was
+    /// running. `newConfiguration.relayEnabled` becomes the value the
+    /// restarted (or next-started) PCMUDPSender launches with; call this with
+    /// the current `relayEnabled` (not necessarily the value passed to
+    /// `init`) to avoid a restart reverting a live `setRelayEnabled` toggle.
     public func updateConfiguration(_ newConfiguration: Configuration) {
         let wasRunning = isRunning
         configuration = newConfiguration
+        relayEnabled = newConfiguration.relayEnabled
         if wasRunning {
             start()
         }
