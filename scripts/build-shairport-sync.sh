@@ -8,11 +8,14 @@
 # popt libconfig-hr openssl3 soxr — install any missing ones with
 # `sudo port install <name>`.
 #
-# Built WITHOUT --with-metadata/--with-ffmpeg/--with-airplay-2 (upstream's own
-# configure.ac only pulls in ffmpeg for those), keeping the dependency tree to
-# just popt/libconfig/openssl/soxr plus system frameworks (dns_sd is part of
-# macOS itself). arm64-only for now; add an x86_64 MacPorts prefix + lipo step
-# here if Intel Mac support is ever needed.
+# Built WITH --with-metadata (track title/artist/album over a named pipe —
+# see AirPlayReceiverController's metadata-pipe reader) but WITHOUT
+# --with-ffmpeg/--with-airplay-2 (upstream's own configure.ac only pulls in
+# ffmpeg for those), keeping the dependency tree to just
+# popt/libconfig/openssl/soxr plus system frameworks (dns_sd is part of macOS
+# itself) — --with-metadata itself needs nothing beyond that. arm64-only for
+# now; add an x86_64 MacPorts prefix + lipo step here if Intel Mac support is
+# ever needed.
 set -euo pipefail
 
 SS_VERSION="5.1"
@@ -43,10 +46,31 @@ fi
 tar xzf "${TARBALL}" -C "${BUILD_DIR}"
 SRC_DIR="$(find "${BUILD_DIR}" -maxdepth 1 -type d -name 'shairport-sync-*')"
 
+# Patch in a parent-death watchdog: this vendored build is always launched as
+# a supervised child by AirPlayReceiverController, but shairport-sync itself
+# has no --exit-with-parent equivalent (unlike PipelineHelpers' PCMUDPSender)
+# and explicitly ignores SIGPIPE (`signal(SIGPIPE, SIG_IGN)` in shairport.c),
+# so it never notices or reacts to its downstream pipe breaking. Without this,
+# an abnormal host-app exit (crash, force-quit) leaves it running as an
+# orphan holding RTSP port 5000, blocking every later launch attempt from
+# binding — confirmed live during development. Polls getppid() every 500ms,
+# the same technique and cadence as PCMUDPSender's own watchdog, and exits
+# promptly once reparented (to launchd/PID 1).
+echo "==> Patching in a parent-death watchdog"
+SHAIRPORT_C="${SRC_DIR}/shairport.c"
+grep -q '^#include <unistd.h>$' "${SHAIRPORT_C}" || { echo "error: patch anchor (unistd.h include) not found in shairport.c" >&2; exit 1; }
+perl -0777 -pi -e 's/^#include <unistd\.h>$/#include <unistd.h>\n#include <pthread.h>\n#include <time.h>/m' "${SHAIRPORT_C}"
+
+grep -q '^int main(int argc, char \*\*argv) {$' "${SHAIRPORT_C}" || { echo "error: patch anchor (main signature) not found in shairport.c" >&2; exit 1; }
+perl -0777 -pi -e 's/^int main\(int argc, char \*\*argv\) \{$/static pid_t antennahead_original_ppid;\nstatic void *antennahead_parent_watchdog(void *arg) {\n  (void)arg;\n  while (1) {\n    struct timespec ts = {0, 500000000L};\n    nanosleep(&ts, NULL);\n    if (getppid() != antennahead_original_ppid)\n      _exit(1);\n  }\n  return NULL;\n}\n\nint main(int argc, char **argv) {/m' "${SHAIRPORT_C}"
+
+grep -q '^  debug_init(0, 0, 1, 1);$' "${SHAIRPORT_C}" || { echo "error: patch anchor (debug_init call) not found in shairport.c" >&2; exit 1; }
+perl -0777 -pi -e 's/^  debug_init\(0, 0, 1, 1\);$/  debug_init(0, 0, 1, 1);\n  antennahead_original_ppid = getppid();\n  pthread_t antennahead_watchdog_thread;\n  pthread_create(&antennahead_watchdog_thread, NULL, antennahead_parent_watchdog, NULL);\n  pthread_detach(antennahead_watchdog_thread);/m' "${SHAIRPORT_C}"
+
 echo "==> autoreconf"
 (cd "${SRC_DIR}" && autoreconf -fi)
 
-echo "==> configure (AirPlay 1 only: no metadata/ffmpeg/airplay-2)"
+echo "==> configure (AirPlay 1 only: metadata enabled, no ffmpeg/airplay-2)"
 (cd "${SRC_DIR}" && ./configure \
     --with-os=darwin \
     --with-ssl=openssl \
@@ -54,6 +78,7 @@ echo "==> configure (AirPlay 1 only: no metadata/ffmpeg/airplay-2)"
     --with-stdout \
     --with-pipe \
     --with-soxr \
+    --with-metadata \
     --with-piddir="${BUILD_DIR}" \
     --sysconfdir="${BUILD_DIR}/etc")
 

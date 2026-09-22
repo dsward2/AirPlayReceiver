@@ -5,9 +5,10 @@ import Foundation
 /// one reviewable place.
 ///
 /// Built with `--with-ssl=openssl --with-dns_sd --with-stdout --with-pipe
-/// --with-soxr` and no `--with-metadata`/`--with-airplay-2` (see
+/// --with-soxr --with-metadata` and no `--with-airplay-2` (see
 /// scripts/build-shairport-sync.sh) — classic AirPlay 1 (RAOP) only, emitting
-/// raw S16LE 44100 Hz stereo PCM on stdout.
+/// raw S16LE 44100 Hz stereo PCM on stdout, plus a metadata pipe for track
+/// title/artist/album (see `AirPlayReceiverController`'s metadata-pipe reader).
 enum ShairportSyncArguments {
     /// - Parameter sessionMarkerPath: a file path shairport-sync's `-B`/`-E`
     ///   hooks touch when a play session begins and remove when it ends (via
@@ -16,7 +17,11 @@ enum ShairportSyncArguments {
     ///   to know whether an AirPlay client is actively streaming, as opposed
     ///   to just connected/idle. No `-w`/`--wait-cmd`: the hook runs
     ///   fire-and-forget so it can't add latency to playback starting/stopping.
-    static func make(deviceName: String, password: String?, sessionMarkerPath: String) -> [String] {
+    /// - Parameter metadataPipePath: a FIFO shairport-sync writes track
+    ///   metadata to while `--with-metadata` is compiled in — see
+    ///   `AirPlayReceiverController.startMetadataPipeReading`.
+    static func make(deviceName: String, password: String?, sessionMarkerPath: String,
+                     metadataPipePath: String) -> [String] {
         // No --configfile is passed: shairport-sync's default config path won't
         // resolve in this embedded context, which it already handles gracefully
         // (falls back to built-in defaults) rather than erroring out.
@@ -24,7 +29,9 @@ enum ShairportSyncArguments {
             "-a", deviceName,
             "-o", "stdout",
             "-B", "/usr/bin/touch '\(sessionMarkerPath)'",
-            "-E", "/bin/rm -f '\(sessionMarkerPath)'"
+            "-E", "/bin/rm -f '\(sessionMarkerPath)'",
+            "--metadata-enable",
+            "--metadata-pipename", metadataPipePath
         ]
         if let password, !password.isEmpty {
             args.append(contentsOf: ["--password", password])
