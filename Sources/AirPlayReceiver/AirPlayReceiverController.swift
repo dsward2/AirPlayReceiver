@@ -71,9 +71,12 @@ public final class AirPlayReceiverController {
     private static let outputChannels = 2
     /// Local-only UDP port PCMUDPSender's `--control-port` binds, for live
     /// relay mute/unmute (see `setRelayEnabled`). Fixed rather than
-    /// negotiated: this socket never leaves the host and nothing else in
-    /// this process tree uses it.
-    private static let relayControlPort: UInt16 = 6029
+    /// negotiated: this socket never leaves the host. Must not share a port
+    /// with any other loopback control listener on the Mac — this used to be
+    /// 6029, which AntennaHead's PCMDelay stage also binds (127.0.0.1); the
+    /// more specific loopback bind then silently received every relay
+    /// command. See antennahead-workspace/NETWORK_PORTS.md.
+    private static let relayControlPort: UInt16 = 6034
     /// How often `isReceivingAudio` re-checks the session marker file.
     private static let sessionMarkerPollInterval: UInt64 = 1_000_000_000
 
