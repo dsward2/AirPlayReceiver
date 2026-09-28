@@ -458,9 +458,23 @@ public final class AirPlayReceiverController {
             startMetadataPipeReading(path: metadataPipePath)
         }
 
+        // One fixed path, rewritten on every launch rather than a new file per
+        // launch, so restarts don't accumulate files in the temp directory.
+        // Like the metadata pipe, a failure here is non-fatal: shairport-sync
+        // just runs on its built-in defaults without it.
+        var configFilePath: String? = NSTemporaryDirectory().appending("airplay-receiver-shairport-sync.conf")
+        do {
+            try ShairportSyncArguments.configFileContents.write(toFile: configFilePath!, atomically: true, encoding: .utf8)
+        } catch {
+            onLog?("AirPlayReceiverController",
+                   "Couldn't write shairport-sync config file: \(error.localizedDescription) — a stale AirPlay session will block new connections until the receiver restarts")
+            configFilePath = nil
+        }
+
         let receiver = pipelineManager.makeTaskItem(pathToExecutable: executablePath, functionName: "shairport-sync")
         for arg in ShairportSyncArguments.make(deviceName: configuration.deviceName, password: configuration.password,
-                                               sessionMarkerPath: sessionMarkerPath, metadataPipePath: metadataPipePath) {
+                                               sessionMarkerPath: sessionMarkerPath, metadataPipePath: metadataPipePath,
+                                               configFilePath: configFilePath) {
             receiver.addArgument(arg)
         }
 
